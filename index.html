@@ -1,0 +1,545 @@
+# ============================================================
+# COMPLETE DJANGO-BASED SINUSITIS DETECTION SYSTEM
+# Single file setup for easy deployment
+# ============================================================
+
+"""
+SETUP INSTRUCTIONS:
+1. Install dependencies: pip install django pillow ultralytics torch torchvision
+2. Place your 'final.pt' file in 'assets/' folder
+3. Run: python manage.py migrate
+4. Run: python manage.py runserver
+5. Visit: http://127.0.0.1:8000/
+"""
+
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+import json
+
+# ============================================================
+# STEP 1: CREATE DJANGO PROJECT STRUCTURE
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Create necessary directories
+MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_ROOT.mkdir(exist_ok=True)
+(MEDIA_ROOT / 'uploads').mkdir(exist_ok=True)
+(MEDIA_ROOT / 'results').mkdir(exist_ok=True)
+(BASE_DIR / 'assets').mkdir(exist_ok=True)
+(BASE_DIR / 'templates').mkdir(exist_ok=True)
+
+# ============================================================
+# DJANGO SETTINGS
+# ============================================================
+
+SECRET_KEY = 'your-secret-key-change-in-production'
+DEBUG = True
+ALLOWED_HOSTS = ['*']
+
+INSTALLED_APPS = [
+    'django.contrib.contenttypes',
+    'django.contrib.staticfiles',
+]
+
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'django.middleware.common.CommonMiddleware',
+]
+
+ROOT_URLCONF = __name__
+TEMPLATES = [{
+    'BACKEND': 'django.template.backends.django.DjangoTemplates',
+    'DIRS': [BASE_DIR / 'templates'],
+    'OPTIONS': {'context_processors': [
+        'django.template.context_processors.request',
+    ]},
+}]
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+
+STATIC_URL = '/static/'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = str(MEDIA_ROOT)
+
+# ============================================================
+# YOLO DETECTION SERVICE
+# ============================================================
+
+from ultralytics import YOLO
+from PIL import Image
+import torch
+
+class SinusitisDetector:
+    def __init__(self):
+        self.model_path = BASE_DIR / 'assets' / 'final.pt'
+        self.model = None
+        self.load_model()
+    
+    def load_model(self):
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {self.model_path}")
+        print(f"Loading YOLO model from {self.model_path}...")
+        self.model = YOLO(str(self.model_path))
+        print("Model loaded successfully!")
+    
+    def detect(self, image_path, conf_threshold=0.25):
+        """Run detection on image"""
+        results = self.model.predict(
+            source=str(image_path),
+            conf=conf_threshold,
+            save=False,
+            verbose=False
+        )
+        
+        detections = []
+        result = results[0]
+        
+        for box in result.boxes:
+            detection = {
+                'class': result.names[int(box.cls[0])],
+                'confidence': float(box.conf[0]),
+                'bbox': box.xyxy[0].tolist()
+            }
+            detections.append(detection)
+        
+        # Save annotated image
+        annotated = result.plot()
+        annotated_img = Image.fromarray(annotated)
+        
+        return detections, annotated_img
+
+# Initialize detector globally
+detector = SinusitisDetector()
+
+# ============================================================
+# DJANGO VIEWS
+# ============================================================
+
+from django.shortcuts import render
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.core.files.storage import FileSystemStorage
+from django.conf import settings
+
+def home(request):
+    """Main page with upload form"""
+    return render(request, 'index.html')
+
+@csrf_exempt
+def detect_sinusitis(request):
+    """Handle image upload and detection"""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
+    
+    if 'image' not in request.FILES:
+        return JsonResponse({'error': 'No image file provided'}, status=400)
+    
+    try:
+        # Save uploaded image
+        uploaded_file = request.FILES['image']
+        fs = FileSystemStorage(location=MEDIA_ROOT / 'uploads')
+        filename = fs.save(uploaded_file.name, uploaded_file)
+        image_path = fs.path(filename)
+        
+        # Get confidence threshold
+        conf_threshold = float(request.POST.get('confidence', 0.25))
+        
+        # Run detection
+        detections, annotated_img = detector.detect(image_path, conf_threshold)
+        
+        # Save annotated result
+        result_filename = f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        result_path = MEDIA_ROOT / 'results' / result_filename
+        annotated_img.save(result_path)
+        
+        return JsonResponse({
+            'success': True,
+            'detections': detections,
+            'original_image': f'/media/uploads/{filename}',
+            'result_image': f'/media/results/{result_filename}',
+            'total_detections': len(detections)
+        })
+    
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+@csrf_exempt
+def batch_detect(request):
+    """Handle multiple image uploads"""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Only POST method allowed'}, status=405)
+    
+    files = request.FILES.getlist('images')
+    if not files:
+        return JsonResponse({'error': 'No image files provided'}, status=400)
+    
+    results = []
+    conf_threshold = float(request.POST.get('confidence', 0.25))
+    
+    for uploaded_file in files:
+        try:
+            fs = FileSystemStorage(location=MEDIA_ROOT / 'uploads')
+            filename = fs.save(uploaded_file.name, uploaded_file)
+            image_path = fs.path(filename)
+            
+            detections, annotated_img = detector.detect(image_path, conf_threshold)
+            
+            result_filename = f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+            result_path = MEDIA_ROOT / 'results' / result_filename
+            annotated_img.save(result_path)
+            
+            results.append({
+                'filename': uploaded_file.name,
+                'detections': detections,
+                'result_image': f'/media/results/{result_filename}'
+            })
+        except Exception as e:
+            results.append({
+                'filename': uploaded_file.name,
+                'error': str(e)
+            })
+    
+    return JsonResponse({'success': True, 'results': results})
+
+# ============================================================
+# URL PATTERNS
+# ============================================================
+
+from django.urls import path
+from django.conf.urls.static import static
+
+urlpatterns = [
+    path('', home, name='home'),
+    path('detect/', detect_sinusitis, name='detect'),
+    path('batch-detect/', batch_detect, name='batch_detect'),
+] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+# ============================================================
+# HTML TEMPLATE (Auto-generated)
+# ============================================================
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sinusitis Detection System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            text-align: center;
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 40px;
+        }
+        .upload-section {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            background: #f8f9ff;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .upload-section:hover {
+            background: #eef1ff;
+            border-color: #764ba2;
+        }
+        .upload-icon {
+            font-size: 4em;
+            margin-bottom: 20px;
+        }
+        input[type="file"] { display: none; }
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 40px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 1.1em;
+            margin: 10px;
+            transition: transform 0.2s;
+        }
+        .btn:hover { transform: scale(1.05); }
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .controls {
+            margin: 30px 0;
+            text-align: center;
+        }
+        .confidence-slider {
+            width: 300px;
+            margin: 0 10px;
+        }
+        .results {
+            margin-top: 40px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 30px;
+        }
+        .result-card {
+            background: #f8f9ff;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        .result-card img {
+            width: 100%;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+        .detection-info {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 10px;
+        }
+        .detection-item {
+            padding: 10px;
+            margin: 5px 0;
+            background: #eef1ff;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .confidence-badge {
+            background: #667eea;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 0.9em;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            display: none;
+        }
+        .spinner {
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #667eea;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .error {
+            background: #ff4444;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏥 Sinusitis Detection System</h1>
+        <p class="subtitle">Upload PNS X-Ray images for automated analysis</p>
+        
+        <div class="upload-section" onclick="document.getElementById('fileInput').click()">
+            <div class="upload-icon">📁</div>
+            <h3>Click to Upload X-Ray Image(s)</h3>
+            <p>Supports JPG, PNG (Single or Multiple Files)</p>
+            <input type="file" id="fileInput" accept="image/*" multiple>
+        </div>
+        
+        <div class="controls">
+            <label>Confidence Threshold: <span id="confValue">0.25</span></label>
+            <input type="range" class="confidence-slider" id="confSlider" 
+                   min="0.1" max="0.9" step="0.05" value="0.25">
+            <br><br>
+            <button class="btn" id="detectBtn" disabled>🔍 Detect Sinusitis</button>
+            <button class="btn" id="clearBtn">🗑️ Clear Results</button>
+        </div>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Analyzing images...</p>
+        </div>
+        
+        <div id="error"></div>
+        <div class="results" id="results"></div>
+    </div>
+
+    <script>
+        let selectedFiles = [];
+        
+        const fileInput = document.getElementById('fileInput');
+        const detectBtn = document.getElementById('detectBtn');
+        const confSlider = document.getElementById('confSlider');
+        const confValue = document.getElementById('confValue');
+        const loading = document.getElementById('loading');
+        const results = document.getElementById('results');
+        const errorDiv = document.getElementById('error');
+        
+        fileInput.addEventListener('change', (e) => {
+            selectedFiles = Array.from(e.target.files);
+            detectBtn.disabled = selectedFiles.length === 0;
+            if (selectedFiles.length > 0) {
+                document.querySelector('.upload-section h3').textContent = 
+                    `${selectedFiles.length} file(s) selected`;
+            }
+        });
+        
+        confSlider.addEventListener('input', (e) => {
+            confValue.textContent = e.target.value;
+        });
+        
+        detectBtn.addEventListener('click', async () => {
+            if (selectedFiles.length === 0) return;
+            
+            errorDiv.innerHTML = '';
+            results.innerHTML = '';
+            loading.style.display = 'block';
+            detectBtn.disabled = true;
+            
+            const formData = new FormData();
+            const endpoint = selectedFiles.length === 1 ? '/detect/' : '/batch-detect/';
+            
+            if (selectedFiles.length === 1) {
+                formData.append('image', selectedFiles[0]);
+            } else {
+                selectedFiles.forEach(file => formData.append('images', file));
+            }
+            formData.append('confidence', confSlider.value);
+            
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                displayResults(data);
+            } catch (error) {
+                errorDiv.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+            } finally {
+                loading.style.display = 'none';
+                detectBtn.disabled = false;
+            }
+        });
+        
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            results.innerHTML = '';
+            errorDiv.innerHTML = '';
+            selectedFiles = [];
+            fileInput.value = '';
+            detectBtn.disabled = true;
+            document.querySelector('.upload-section h3').textContent = 
+                'Click to Upload X-Ray Image(s)';
+        });
+        
+        function displayResults(data) {
+            if (data.results) {
+                // Batch results
+                data.results.forEach(item => {
+                    results.innerHTML += createResultCard(
+                        item.filename,
+                        item.detections || [],
+                        item.result_image
+                    );
+                });
+            } else {
+                // Single result
+                results.innerHTML = createResultCard(
+                    'Detection Result',
+                    data.detections,
+                    data.result_image
+                );
+            }
+        }
+        
+        function createResultCard(title, detections, imageUrl) {
+            const detectionsHtml = detections.length > 0
+                ? detections.map(d => `
+                    <div class="detection-item">
+                        <strong>${d.class}</strong>
+                        <span class="confidence-badge">${(d.confidence * 100).toFixed(1)}%</span>
+                    </div>
+                `).join('')
+                : '<p style="text-align:center;color:#999;">No detections found</p>';
+            
+            return `
+                <div class="result-card">
+                    <h3>${title}</h3>
+                    <img src="${imageUrl}" alt="Detection Result">
+                    <div class="detection-info">
+                        <h4>Detections (${detections.length})</h4>
+                        ${detectionsHtml}
+                    </div>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
+"""
+
+# Write template file
+with open(BASE_DIR / 'templates' / 'index.html', 'w') as f:
+    f.write(HTML_TEMPLATE)
+
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
+
+if __name__ == '__main__':
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', __name__)
+    
+    from django.core.management import execute_from_command_line
+    
+    # Auto-run migrations
+    if 'runserver' in sys.argv:
+        print("\n" + "="*60)
+        print("🏥 SINUSITIS DETECTION SYSTEM")
+        print("="*60)
+        print(f"Model Path: {BASE_DIR / 'assets' / 'final.pt'}")
+        print(f"Media Storage: {MEDIA_ROOT}")
+        print("\n✅ Starting server...")
+        print("🌐 Visit: http://127.0.0.1:8000/")
+        print("="*60 + "\n")
+    
+    execute_from_command_line(sys.argv)
